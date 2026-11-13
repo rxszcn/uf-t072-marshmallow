@@ -175,6 +175,10 @@ class Field(typing.Generic[_InternalT]):
         "required": "Missing data for required field.",
         "null": "Field may not be null.",
         "validator_failed": "Invalid value.",
+        "invalid_type": (
+            "Field {field_name!r} expects {expected_type} but received "
+            "{input_type}: {input!r}."
+        ),
     }
 
     def __init__(
@@ -289,6 +293,27 @@ class Field(typing.Generic[_InternalT]):
         if isinstance(msg, (str, bytes)):
             msg = msg.format(**kwargs)
         return ValidationError(msg)
+
+    def make_type_error(
+        self, expected_type: str, value: typing.Any, attr: str | None = None
+    ) -> ValidationError:
+        """Build a uniform `ValidationError` for serialization type mismatches.
+
+        The message always carries the field name and the expected type so that
+        every field reports contract violations during serialization in the same
+        shape, instead of leaking implementation-level exceptions.
+        """
+        field_name = self.name if self.name is not None else (attr or "")
+        error = self.make_error(
+            "invalid_type",
+            field_name=field_name,
+            expected_type=expected_type,
+            input_type=type(value).__name__,
+            input=value,
+        )
+        if self.name is not None:
+            error.field_name = self.name
+        return error
 
     def _validate_missing(self, value: typing.Any) -> None:
         """Validate missing values. Raise a :exc:`ValidationError` if
@@ -615,7 +640,12 @@ class Nested(Field):
         if nested_obj is None:
             return None
         many = schema.many or self.many
-        return schema.dump(nested_obj, many=many)
+        try:
+            return schema.dump(nested_obj, many=many)
+        except TypeError as error:
+            if many:
+                raise self.make_type_error("collection", nested_obj, attr) from error
+            raise
 
     def _test_collection(self, value: typing.Any) -> None:
         many = self.schema.many or self.many
@@ -765,7 +795,19 @@ class List(Field[list[_InternalT | None]]):
     def _serialize(self, value, attr, obj, **kwargs) -> list[_InternalT] | None:
         if value is None:
             return None
-        return [self.inner._serialize(each, attr, obj, **kwargs) for each in value]
+        result = []
+        errors = {}
+        try:
+            for idx, each in enumerate(value):
+                try:
+                    result.append(self.inner._serialize(each, attr, obj, **kwargs))
+                except ValidationError as error:
+                    errors.update({idx: error.messages})
+        except TypeError as error:
+            raise self.make_type_error("list", value, attr) from error
+        if errors:
+            raise ValidationError(errors)
+        return result
 
     def _deserialize(self, value, attr, data, **kwargs) -> list[_InternalT | None]:
         if not utils.is_collection(value):
@@ -806,7 +848,13 @@ class Tuple(Field[tuple]):
     """
 
     #: Default error messages.
-    default_error_messages = {"invalid": "Not a valid tuple."}
+    default_error_messages = {
+        "invalid": "Not a valid tuple.",
+        "invalid_length": (
+            "Field {field_name!r} expects a tuple of length {expected_length} "
+            "but received {input_length}: {input!r}."
+        ),
+    }
 
     def __init__(
         self,
@@ -848,10 +896,34 @@ class Tuple(Field[tuple]):
         if value is None:
             return None
 
-        return tuple(
-            field._serialize(each, attr, obj, **kwargs)
-            for field, each in zip(self.tuple_fields, value, strict=True)
-        )
+        try:
+            value = tuple(value)
+        except TypeError as error:
+            raise self.make_type_error("tuple", value, attr) from error
+        if len(value) != len(self.tuple_fields):
+            length_error = self.make_error(
+                "invalid_length",
+                field_name=self.name if self.name is not None else (attr or ""),
+                expected_length=len(self.tuple_fields),
+                input_length=len(value),
+                input=value,
+            )
+            if self.name is not None:
+                length_error.field_name = self.name
+            raise length_error
+
+        result = []
+        errors = {}
+        for idx, (field, each) in enumerate(
+            zip(self.tuple_fields, value, strict=False)
+        ):
+            try:
+                result.append(field._serialize(each, attr, obj, **kwargs))
+            except ValidationError as error:
+                errors.update({idx: error.messages})
+        if errors:
+            raise ValidationError(errors)
+        return tuple(result)
 
     def _deserialize(
         self,
@@ -896,7 +968,10 @@ class String(Field[str]):
     def _serialize(self, value, attr, obj, **kwargs) -> str | None:
         if value is None:
             return None
-        return utils.ensure_text_type(value)
+        try:
+            return utils.ensure_text_type(value)
+        except UnicodeDecodeError as error:
+            raise self.make_type_error("string", value, attr) from error
 
     def _deserialize(self, value, attr, data, **kwargs) -> str:
         if not isinstance(value, (str, bytes)):
@@ -987,7 +1062,10 @@ class Number(Field[_NumT], metaclass=abc.ABCMeta):
         """Return a string if `self.as_string=True`, otherwise return this field's `num_type`."""
         if value is None:
             return None
-        ret: _NumT = self._format_num(value)
+        try:
+            ret: _NumT = self._format_num(value)
+        except (TypeError, ValueError, decimal.InvalidOperation) as error:
+            raise self.make_type_error(self.num_type.__name__, value, attr) from error
         return self._to_string(ret) if self.as_string else ret
 
     def _deserialize(self, value, attr, data, **kwargs) -> _NumT:
@@ -1271,11 +1349,17 @@ class _TemporalField(Field[_D], metaclass=abc.ABCMeta):
     def _serialize(self, value: _D | None, attr, obj, **kwargs) -> str | float | None:
         if value is None:
             return None
+        internal_type: type[_D] = getattr(dt, self.OBJ_TYPE)
+        if not isinstance(value, internal_type):
+            raise self.make_type_error(self.OBJ_TYPE, value, attr)
         data_format = self.format or self.DEFAULT_FORMAT
         format_func = self.SERIALIZATION_FUNCS.get(data_format)
-        if format_func:
-            return format_func(value)
-        return value.strftime(data_format)
+        try:
+            if format_func:
+                return format_func(value)
+            return value.strftime(data_format)
+        except (TypeError, AttributeError, ValueError) as error:
+            raise self.make_type_error(self.OBJ_TYPE, value, attr) from error
 
     def _deserialize(self, value, attr, data, **kwargs) -> _D:
         internal_type: type[_D] = getattr(dt, self.OBJ_TYPE)
@@ -1553,6 +1637,8 @@ class TimeDelta(Field[dt.timedelta]):
     def _serialize(self, value, attr, obj, **kwargs) -> float | None:
         if value is None:
             return None
+        if not isinstance(value, dt.timedelta):
+            raise self.make_type_error("timedelta", value, attr)
 
         # limit float arithmetics to a single division to minimize precision loss
         microseconds: int = utils.timedelta_to_microseconds(value)
@@ -1653,25 +1739,44 @@ class Mapping(Field[_MappingT], metaclass=abc.ABCMeta):
         if value is None:
             return None
         if not self.value_field and not self.key_field:
-            return self.mapping_type(value)
+            try:
+                return self.mapping_type(value)
+            except (TypeError, ValueError) as error:
+                raise self.make_type_error("mapping", value, attr) from error
 
-        # Serialize keys
-        if self.key_field is None:
-            keys = {k: k for k in value}
-        else:
-            keys = {
-                k: self.key_field._serialize(k, None, None, **kwargs) for k in value
-            }
+        errors = collections.defaultdict(dict)
 
-        # Serialize values
-        result = self.mapping_type()
-        if self.value_field is None:
-            for k, v in value.items():
-                if k in keys:
-                    result[keys[k]] = v
-        else:
-            for k, v in value.items():
-                result[keys[k]] = self.value_field._serialize(v, None, None, **kwargs)
+        try:
+            # Serialize keys
+            if self.key_field is None:
+                keys = {k: k for k in value}
+            else:
+                keys = {}
+                for key in value:
+                    try:
+                        keys[key] = self.key_field._serialize(key, attr, None, **kwargs)
+                    except ValidationError as error:
+                        errors[key]["key"] = error.messages
+
+            # Serialize values
+            result = self.mapping_type()
+            if self.value_field is None:
+                for k, v in value.items():
+                    if k in keys:
+                        result[keys[k]] = v
+            else:
+                for k, v in value.items():
+                    try:
+                        result[keys[k]] = self.value_field._serialize(
+                            v, attr, None, **kwargs
+                        )
+                    except ValidationError as error:
+                        errors[k]["value"] = error.messages
+        except TypeError as error:
+            raise self.make_type_error("mapping", value, attr) from error
+
+        if errors:
+            raise ValidationError(dict(errors))
 
         return result
 
@@ -1814,6 +1919,8 @@ class IP(Field[ipaddress.IPv4Address | ipaddress.IPv6Address]):
     def _serialize(self, value, attr, obj, **kwargs) -> str | None:
         if value is None:
             return None
+        if not isinstance(value, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
+            raise self.make_type_error("IP address", value, attr)
         if self.exploded:
             return value.exploded
         return value.compressed
@@ -1876,6 +1983,8 @@ class IPInterface(Field[ipaddress.IPv4Interface | ipaddress.IPv6Interface]):
     def _serialize(self, value, attr, obj, **kwargs) -> str | None:
         if value is None:
             return None
+        if not isinstance(value, (ipaddress.IPv4Interface, ipaddress.IPv6Interface)):
+            raise self.make_type_error("IP interface", value, attr)
         if self.exploded:
             return value.exploded
         return value.compressed
@@ -1969,6 +2078,8 @@ class Enum(Field[_EnumT]):
     ) -> typing.Any | None:
         if value is None:
             return None
+        if not isinstance(value, self.enum):
+            raise self.make_type_error(self.enum.__name__, value, attr)
         if self.by_value:
             val = value.value
         else:

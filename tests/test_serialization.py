@@ -2,6 +2,7 @@
 
 import datetime as dt
 import decimal
+import enum
 import ipaddress
 import itertools
 import math
@@ -13,6 +14,7 @@ import pytest
 
 from marshmallow import Schema, fields
 from marshmallow import missing as missing_
+from marshmallow.exceptions import ValidationError
 from tests.base import ALL_FIELDS, DateEnum, GenderEnum, HairColorEnum, User, central
 
 
@@ -1000,3 +1002,296 @@ def test_nested_field_many_serializing_generator():
     data = OtherSchema().dump(obj)
 
     assert data.get("objects") == [{"name": "foo"}, {"name": "bar"}]
+
+
+def _assert_type_error(exc_info, *, field_name, expected_type, input_type, value):
+    """Assert a uniform serialization type-mismatch ValidationError.
+
+    Every field must report the same shape: a ValidationError whose message
+    carries the field name and the expected type, instead of leaking an
+    implementation-level exception.
+    """
+    error = exc_info.value
+    assert isinstance(error, ValidationError)
+    message = error.messages[0]
+    assert field_name in message
+    assert expected_type in message
+    assert input_type in message
+    assert repr(value) in message
+
+
+class TestSerializationTypeMismatch:
+    """Every field enforces its serialization type boundary uniformly."""
+
+    @pytest.mark.parametrize(
+        ("field", "value", "expected_type"),
+        [
+            (fields.Int(), "not-an-int", "int"),
+            (fields.Float(), {"not": "a number"}, "float"),
+            (fields.Decimal(), object(), "Decimal"),
+            (fields.DateTime(), "not-a-datetime", "datetime"),
+            (fields.DateTime(), 42, "datetime"),
+            (fields.DateTime(format="timestamp"), "not-a-datetime", "datetime"),
+            (fields.Date(), "not-a-date", "date"),
+            (fields.Time(), "not-a-time", "time"),
+            (fields.String(), b"\xff\xfe", "string"),
+            (fields.TimeDelta(), "not-a-timedelta", "timedelta"),
+            (fields.IP(), 123, "IP address"),
+            (fields.IP(), "not-an-ip", "IP address"),
+            (fields.IPv4(), 123, "IP address"),
+            (fields.IPv6(), 123, "IP address"),
+            (fields.IPInterface(), 123, "IP interface"),
+            (fields.IPv4Interface(), 123, "IP interface"),
+            (fields.IPv6Interface(), 123, "IP interface"),
+        ],
+    )
+    def test_scalar_fields_raise_validation_error(self, field, value, expected_type):
+        with pytest.raises(ValidationError) as exc_info:
+            field.serialize("f", {"f": value})
+        _assert_type_error(
+            exc_info,
+            field_name="f",
+            expected_type=expected_type,
+            input_type=type(value).__name__,
+            value=value,
+        )
+
+    def test_int_invalid_string_no_longer_leaks_value_error(self):
+        with pytest.raises(ValidationError) as exc_info:
+            fields.Int().serialize("f", {"f": "abc"})
+        # The implementation-level ValueError is preserved as the cause but
+        # no longer escapes the field boundary.
+        assert isinstance(exc_info.value.__cause__, ValueError)
+        _assert_type_error(
+            exc_info,
+            field_name="f",
+            expected_type="int",
+            input_type="str",
+            value="abc",
+        )
+
+    def test_decimal_invalid_operation_is_unified(self):
+        # decimal.InvalidOperation is neither a TypeError nor a ValueError
+        value = object()
+        with pytest.raises(ValidationError) as exc_info:
+            fields.Decimal().serialize("f", {"f": value})
+        _assert_type_error(
+            exc_info,
+            field_name="f",
+            expected_type="Decimal",
+            input_type="object",
+            value=value,
+        )
+
+    def test_temporal_fields_reject_wrong_type_across_formats(self):
+        temporal_fields: list[fields.Field] = [
+            fields.DateTime(),
+            fields.DateTime(format="rfc"),
+            fields.DateTime(format="timestamp"),
+            fields.DateTime(format="timestamp_ms"),
+            fields.DateTime(format="%Y-%m-%d"),
+            fields.Date(),
+            fields.Time(),
+        ]
+        for field in temporal_fields:
+            with pytest.raises(ValidationError) as exc_info:
+                field.serialize("f", {"f": "not-a-temporal-value"})
+            assert "f" in exc_info.value.messages[0]
+
+    def test_enum_field_rejects_non_member(self):
+        class Color(enum.Enum):
+            RED = 1
+
+        value = object()
+        with pytest.raises(ValidationError) as exc_info:
+            fields.Enum(Color).serialize("f", {"f": value})
+        _assert_type_error(
+            exc_info,
+            field_name="f",
+            expected_type="Color",
+            input_type="object",
+            value=value,
+        )
+
+    def test_nested_many_rejects_non_collection(self):
+        class ChildSchema(Schema):
+            n = fields.Int()
+
+        field = fields.Nested(ChildSchema, many=True)
+        with pytest.raises(ValidationError) as exc_info:
+            field.serialize("children", {"children": 5})
+        _assert_type_error(
+            exc_info,
+            field_name="children",
+            expected_type="collection",
+            input_type="int",
+            value=5,
+        )
+
+    def test_list_element_error_keeps_indexed_structure(self):
+        field = fields.List(fields.Int())
+        with pytest.raises(ValidationError) as exc_info:
+            field.serialize("nums", {"nums": [1, "x", 3]})
+        assert exc_info.value.messages == {
+            1: ["Field 'nums' expects int but received str: 'x'."]
+        }
+
+    def test_list_temporal_element_error_keeps_indexed_structure(self):
+        field = fields.List(fields.DateTime())
+        with pytest.raises(ValidationError) as exc_info:
+            field.serialize("dtimes", {"dtimes": ["not-a-datetime"]})
+        assert list(exc_info.value.messages) == [0]
+        assert "dtimes" in exc_info.value.messages[0][0]
+        assert "datetime" in exc_info.value.messages[0][0]
+
+    def test_list_non_iterable_raises_validation_error(self):
+        field = fields.List(fields.Int())
+        with pytest.raises(ValidationError) as exc_info:
+            field.serialize("nums", {"nums": 5})
+        _assert_type_error(
+            exc_info,
+            field_name="nums",
+            expected_type="list",
+            input_type="int",
+            value=5,
+        )
+
+    def test_tuple_element_error_keeps_indexed_structure(self):
+        field = fields.Tuple([fields.Int(), fields.Int()])
+        with pytest.raises(ValidationError) as exc_info:
+            field.serialize("row", {"row": (1, "x")})
+        assert list(exc_info.value.messages) == [1]
+        assert "row" in exc_info.value.messages[1][0]
+        assert "int" in exc_info.value.messages[1][0]
+
+    def test_tuple_length_mismatch_raises_validation_error(self):
+        field = fields.Tuple([fields.Int(), fields.Int()])
+        with pytest.raises(ValidationError) as exc_info:
+            field.serialize("row", {"row": (1,)})
+        message = exc_info.value.messages[0]
+        assert "row" in message
+        assert "2" in message
+        assert "1" in message
+
+    def test_tuple_non_iterable_raises_validation_error(self):
+        field = fields.Tuple([fields.Int()])
+        with pytest.raises(ValidationError) as exc_info:
+            field.serialize("row", {"row": 5})
+        _assert_type_error(
+            exc_info,
+            field_name="row",
+            expected_type="tuple",
+            input_type="int",
+            value=5,
+        )
+
+    def test_dict_value_error_keeps_nested_structure(self):
+        field = fields.Dict(values=fields.Int())
+        with pytest.raises(ValidationError) as exc_info:
+            field.serialize("data", {"data": {"a": "x"}})
+        assert list(exc_info.value.messages) == ["a"]
+        assert "value" in exc_info.value.messages["a"]
+        assert "int" in exc_info.value.messages["a"]["value"][0]
+
+    def test_dict_key_error_keeps_nested_structure(self):
+        field = fields.Dict(keys=fields.Int())
+        with pytest.raises(ValidationError) as exc_info:
+            field.serialize("data", {"data": {"a": 1}})
+        assert list(exc_info.value.messages) == ["a"]
+        assert "key" in exc_info.value.messages["a"]
+        assert "int" in exc_info.value.messages["a"]["key"][0]
+
+    def test_dict_non_mapping_raises_validation_error(self):
+        field = fields.Dict()
+        with pytest.raises(ValidationError) as exc_info:
+            field.serialize("data", {"data": 5})
+        _assert_type_error(
+            exc_info,
+            field_name="data",
+            expected_type="mapping",
+            input_type="int",
+            value=5,
+        )
+
+    def test_nested_list_element_error_through_schema(self):
+        class ChildSchema(Schema):
+            n = fields.Int()
+
+        class ParentSchema(Schema):
+            items = fields.List(fields.Nested(ChildSchema))
+
+        with pytest.raises(ValidationError) as exc_info:
+            ParentSchema().dump({"items": [{"n": 1}, {"n": "x"}]})
+        # The element-level error keeps the list's existing index-keyed
+        # structure; the nested field's own message is carried underneath.
+        assert list(exc_info.value.messages) == [1]
+        message = exc_info.value.messages[1][0]
+        assert "n" in message
+        assert "int" in message
+
+    def test_schema_dump_error_carries_field_name_and_expected_type(self):
+        class MySchema(Schema):
+            age = fields.Int()
+
+        with pytest.raises(ValidationError) as exc_info:
+            MySchema().dump({"age": "abc"})
+        error = exc_info.value
+        assert error.field_name == "age"
+        assert "age" in error.messages[0]
+        assert "int" in error.messages[0]
+
+    def test_schema_dump_uses_field_name_not_data_key(self):
+        class MySchema(Schema):
+            age = fields.Int(data_key="yearsOld")
+
+        with pytest.raises(ValidationError) as exc_info:
+            MySchema().dump({"age": "abc"})
+        assert "age" in exc_info.value.messages[0]
+        assert "yearsOld" not in exc_info.value.messages[0]
+
+    def test_custom_error_message_is_respected(self):
+        field = fields.Int(
+            error_messages={
+                "invalid_type": "custom {field_name} {expected_type} {input_type}"
+            }
+        )
+        with pytest.raises(ValidationError) as exc_info:
+            field.serialize("age", {"age": "x"})
+        assert exc_info.value.messages == ["custom age int str"]
+
+
+class TestSerializationSilentCoercionRetained:
+    """Historical silent-compatible coercions must not be rolled back."""
+
+    @pytest.mark.parametrize(
+        ("field", "value", "expected"),
+        [
+            # Integer fields silently coerce string numerics
+            (fields.Int(), "42", 42),
+            (fields.Int(as_string=True), 42, "42"),
+            # Float/Decimal likewise accept string numerics
+            (fields.Float(), "1.5", 1.5),
+            (fields.Decimal(), "1.23", decimal.Decimal("1.23")),
+            # Booleans pass numbers through untouched
+            (fields.Boolean(), 1, 1),
+            (fields.Boolean(), 0, 0),
+            (fields.Boolean(), 2, 2),
+            # String fields silently stringify numbers
+            (fields.String(), 123, "123"),
+            (fields.String(), 1.5, "1.5"),
+            # List still iterates strings character by character
+            (fields.List(fields.String()), "ab", ["a", "b"]),
+            # Date accepts datetime (datetime is a date subclass)
+            (fields.Date(), dt.datetime(2020, 1, 2, 3, 4, 5), "2020-01-02"),
+        ],
+    )
+    def test_silent_coercion_unchanged(self, field, value, expected):
+        assert field.serialize("f", {"f": value}) == expected
+
+    def test_int_accepts_bool_on_serialization(self):
+        # Mirrors the historical int(True) -> 1 behavior
+        assert fields.Int().serialize("f", {"f": True}) == 1
+        assert fields.Int().serialize("f", {"f": False}) == 0
+
+    def test_string_decodes_valid_utf8_bytes(self):
+        assert fields.String().serialize("f", {"f": b"foo"}) == "foo"
